@@ -1,8 +1,8 @@
 {
   "name": "@smlc666/pi-auto-review",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": false,
-  "description": "Experimental Guardian API compatibility probe for Pi supporting old Codex and new ChatGPT OAuth login routes; billing unverified",
+  "description": "Experimental Guardian API and reviewer-only random-context stress probe for Pi; billing unverified",
   "type": "module",
   "license": "MIT",
   "engines": {
