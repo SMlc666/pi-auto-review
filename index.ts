@@ -12,7 +12,8 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const MODEL = "codex-auto-review";
-const ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
+const CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses";
+const DIRECT_ENDPOINT = "https://api.openai.com/v1/responses";
 const USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage";
 const MAX_CONTEXT_BYTES = 64 * 1024;
 const REVIEW_TIMEOUT_MS = 30_000;
@@ -56,6 +57,8 @@ type Pending = {
   context: string;
 };
 
+type Route = "codex-backend" | "openai-direct";
+
 type Usage = {
   status: string;
   limits?: Record<string, number>;
@@ -65,7 +68,10 @@ type Report = {
   result: "review-accepted" | "review-denied" | "failed";
   detail: string;
   parentLinked: boolean;
+  route?: Route;
   httpStatus?: number;
+  serverErrorCode?: string;
+  serverErrorParam?: string;
   tokens?: { input: number; cached: number; output: number };
   before?: Usage;
   after?: Usage;
@@ -89,24 +95,29 @@ function textError(error: unknown): string {
   return "Provider or transport error (details intentionally redacted)";
 }
 
-function endpointEligible(ctx: ExtensionContext): { ok: boolean; reason: string } {
+/** Eligibility depends on OAuth audience AND the provider transport, not just its API label. */
+function endpointEligible(ctx: ExtensionContext): { ok: boolean; reason: string; route?: Route } {
   const model = ctx.model;
   if (!model) return { ok: false, reason: "Select a model first." };
-  if (model.api !== "openai-codex-responses") {
-    return { ok: false, reason: `Model API is ${model.api}, expected openai-codex-responses.` };
-  }
-  const bases = ["https://chatgpt.com/backend-api", "https://chatgpt.com/backend-api/codex", ENDPOINT];
-  if (!bases.includes(model.baseUrl?.replace(/\/+$/, "") ?? "")) {
-    return { ok: false, reason: "The active model does not use the official ChatGPT Codex endpoint." };
-  }
   if (!ctx.modelRegistry.isUsingOAuth(model)) {
-    return { ok: false, reason: "The active model is not using ChatGPT OAuth." };
+    return { ok: false, reason: "Stored ChatGPT OAuth is required (API keys are not eligible)." };
   }
   const provider = ctx.modelRegistry.getProvider(model.provider);
   if (!provider?.auth.oauth?.isSubscription) {
-    return { ok: false, reason: "The selected provider does not advertise subscription OAuth." };
+    return { ok: false, reason: "The provider is not registered as a subscription OAuth provider." };
   }
-  return { ok: true, reason: "Official ChatGPT OAuth Codex provider selected." };
+  // Pi's NEW Sign in with ChatGPT credential is explicitly scoped to
+  // https://api.openai.com/v1, not the legacy ChatGPT Codex endpoint.
+  if (model.provider === "openai" && model.api === "openai-responses" &&
+      model.baseUrl?.replace(/\/+$/, "") === "https://api.openai.com/v1") {
+    return { ok: true, route: "openai-direct", reason: "New ChatGPT OAuth uses OpenAI API direct. Guardian free billing is NOT established." };
+  }
+  const bases = ["https://chatgpt.com/backend-api", "https://chatgpt.com/backend-api/codex", CODEX_ENDPOINT];
+  if (model.provider === "openai-codex" && model.api === "openai-codex-responses" &&
+      bases.includes(model.baseUrl?.replace(/\/+$/, "") ?? "")) {
+    return { ok: true, route: "codex-backend", reason: "Legacy Codex backend using subscription OAuth." };
+  }
+  return { ok: false, reason: `Unrecognized provider (${model.provider}), API (${model.api}), or model endpoint. Proxy and API-key paths are not supported.` };
 }
 
 function parseUsage(payload: unknown): Record<string, number> {
@@ -205,37 +216,45 @@ function wire(parent: Parent) {
 async function review(ctx: ExtensionContext, parent: Parent, signal?: AbortSignal): Promise<Report> {
   const deadline = AbortSignal.timeout(REVIEW_TIMEOUT_MS);
   const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  const route = endpointEligible(ctx).route;
+  if (!route) return { result: "failed", detail: "Selected OAuth route is not eligible.", parentLinked: false };
+  const target = route === "codex-backend" ? CODEX_ENDPOINT : DIRECT_ENDPOINT;
   const reviewWire = wire(parent);
   const evidence = JSON.stringify({
     parent_context: JSON.parse(parent.context),
     pending_action: { toolName: "guardian_probe", toolCallId: parent.callId, input: {}, cwd: ctx.cwd },
   });
   if (Buffer.byteLength(evidence, "utf8") > MAX_CONTEXT_BYTES) {
-    return { result: "failed", detail: "Parent context too large: start a new Pi session and retry.", parentLinked: true };
+    return { result: "failed", detail: "Parent context too large: start a new Pi session and retry.", parentLinked: true, route };
   }
   const model = {
     ...parent.model,
     id: MODEL,
     name: MODEL,
-    baseUrl: "https://chatgpt.com/backend-api/codex",
+    baseUrl: route === "codex-backend" ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1",
   };
   let before: Usage | undefined;
   let after: Usage | undefined;
   let originalHeaders: Headers | undefined;
   let httpStatus: number | undefined;
+  let serverErrorCode: string | undefined;
+  let serverErrorParam: string | undefined;
   let requests = 0;
   const fetchReviewer: typeof globalThis.fetch = async (input, init) => {
     if (++requests !== 1) throw new Error("Unexpected additional reviewer request");
     const outgoing = new Request(input, init);
-    if (outgoing.url !== ENDPOINT || outgoing.method !== "POST") {
-      throw new Error("Reviewer endpoint differs from official ChatGPT Codex");
+    if (outgoing.url !== target || outgoing.method !== "POST") {
+      throw new Error("Reviewer endpoint mismatches the OAuth resource");
     }
-    if (!outgoing.headers.get("authorization") || !outgoing.headers.get("chatgpt-account-id")) {
-      throw new Error("Pi SDK did not provide OAuth authorization/account headers");
+    if (!outgoing.headers.get("authorization")) {
+      throw new Error("Pi SDK did not provide authorization");
+    }
+    if (route === "codex-backend" && !outgoing.headers.get("chatgpt-account-id")) {
+      throw new Error("Pi SDK did not provide the Codex account header");
     }
     originalHeaders = new Headers(outgoing.headers);
-    // Read quota immediately after the parent has already completed and before reviewer inference.
-    before = await usageSnapshot(originalHeaders, combined);
+    // Never forward a direct-API-scoped OAuth token to the Codex /wham/usage URL.
+    if (route === "codex-backend") before = await usageSnapshot(originalHeaders, combined);
     const headers = new Headers(outgoing.headers);
     // Do not inherit normal agent routing/feature claims into a fresh reviewer session.
     for (const name of ["x-codex-routing-hint", "x-codex-turn-state", "response-session-id", "x-openai-internal-codex-responses-lite", "x-codex-beta-features"]) {
@@ -245,6 +264,19 @@ async function review(ctx: ExtensionContext, parent: Parent, signal?: AbortSigna
     // Do not masquerade as the official Rust binary; preserve Pi SDK's genuine originator/User-Agent.
     const response = await fetch(new Request(outgoing, { headers, signal: combined, redirect: "error" }));
     httpStatus = response.status;
+    if (!response.ok) {
+      // Bounded allowlisted diagnostics; never disclose raw server errors, prompts or tokens.
+      try {
+        const raw = await response.clone().text();
+        if (raw.length < 8192) {
+          const err = record(record(JSON.parse(raw))?.error);
+          const code = err?.code ?? err?.type;
+          const param = err?.param;
+          if (typeof code === "string" && /^[a-zA-Z0-9_-]{1,72}$/.test(code)) serverErrorCode = code;
+          if (typeof param === "string" && /^[a-zA-Z0-9_.-]{1,96}$/.test(param)) serverErrorParam = param;
+        }
+      } catch { /* No diagnostic code. */ }
+    }
     return response;
   };
   try {
@@ -278,40 +310,45 @@ async function review(ctx: ExtensionContext, parent: Parent, signal?: AbortSigna
         text: { format: { type: "json_schema", name: "codex_output_schema", strict: false, schema: SCHEMA } },
       }),
     }).result();
-    if (originalHeaders) after = await usageSnapshot(originalHeaders, combined);
+    if (originalHeaders && route === "codex-backend") after = await usageSnapshot(originalHeaders, combined);
     const text = result.content.filter((part): part is Extract<(typeof result.content)[number], { type: "text" }> => part.type === "text").map(part => part.text).join("");
     let answer: unknown;
     try { answer = JSON.parse(text); } catch { answer = undefined; }
     const obj = record(answer);
     const acceptable = requests === 1 && httpStatus === 200 && result.stopReason === "stop" && result.model === MODEL;
     if (!acceptable || !["allow", "deny"].includes(String(obj?.outcome))) {
-      return { result: "failed", detail: `Review response not valid JSON assessment (stopReason=${result.stopReason}).`, parentLinked: true, httpStatus, before, after };
+      return { result: "failed", detail: `Review response not valid JSON assessment (stopReason=${result.stopReason}).`, parentLinked: true, route, httpStatus, serverErrorCode, serverErrorParam, before, after };
     }
     return {
       result: obj?.outcome === "allow" ? "review-accepted" : "review-denied",
       detail: typeof obj?.rationale === "string" ? obj.rationale.slice(0, 240) : "Guardian returned a valid decision.",
       parentLinked: true,
+      route,
       httpStatus,
       tokens: { input: result.usage.input, cached: result.usage.cacheRead, output: result.usage.output },
       before, after,
     };
   } catch (error) {
-    if (originalHeaders) after = await usageSnapshot(originalHeaders, AbortSignal.timeout(7000));
-    return { result: "failed", detail: textError(error), parentLinked: true, httpStatus, before, after };
+    if (originalHeaders && route === "codex-backend") after = await usageSnapshot(originalHeaders, AbortSignal.timeout(7000));
+    return { result: "failed", detail: textError(error), parentLinked: true, route, httpStatus, serverErrorCode, serverErrorParam, before, after };
   }
 }
 
 function formatReport(report: Report): string {
   const lines = [
     `Guardian API: ${report.result} (${report.httpStatus ? `HTTP ${report.httpStatus}` : "no successful HTTP response"})`,
+    `Route: ${report.route === "openai-direct" ? "OpenAI API direct (NEW ChatGPT login; NOT confirmed free)" : report.route === "codex-backend" ? "ChatGPT Codex backend" : "not selected"}`,
     `Real parent-response linkage: ${report.parentLinked ? "yes" : "no"}`,
     `Detail: ${report.detail}`,
   ];
+  if (report.serverErrorCode) lines.push(`Server error code: ${report.serverErrorCode}`);
+  if (report.serverErrorParam) lines.push(`Server error parameter: ${report.serverErrorParam}`);
   if (report.tokens) lines.push(`Reviewer tokens observed: input=${report.tokens.input}, cacheRead=${report.tokens.cached}, output=${report.tokens.output}. This is NOT a billing measurement.`);
   for (const [label, sample] of [["Before", report.before], ["After", report.after]] as const) {
     if (sample) lines.push(`${label} quota: ${sample.status}${sample.limits ? ` ${JSON.stringify(sample.limits)}` : ""}`);
   }
-  lines.push("FREE BILLING: UNVERIFIED. A valid review or unchanged rounded quota percentage cannot establish zero charge.");
+  if (report.route === "openai-direct") lines.push("QUOTA: Unavailable. New OAuth is scoped to api.openai.com/v1; Codex /wham/usage is a different OAuth resource.");
+  lines.push("FREE BILLING: UNVERIFIED. HTTP 200 or unchanged quota does not establish zero charge.");
   return lines.join("\n");
 }
 
@@ -330,19 +367,26 @@ export default function (pi: ExtensionAPI): void {
   pi.on("session_before_compact", reset);
 
   pi.on("before_provider_request", (event, ctx) => {
-    if (!armed || !endpointEligible(ctx).ok) return;
+    if (!armed) return;
+    const eligible = endpointEligible(ctx);
+    if (!eligible.ok || !eligible.route) return;
     const payload = record(event.payload);
     if (!payload || payload.model !== ctx.model?.id) return;
-    // Only the explicitly armed parent inference gets the Guardian credit request.
-    const metadata = { ...(record(payload.client_metadata) ?? {}) };
-    delete metadata.parent_response_id;
-    metadata.guardian_credits_requested = "true";
-    const updated = { ...payload, client_metadata: metadata };
+    // Only the Codex backend is known to accept Guardian billing metadata.
+    // Do not add unsupported metadata to the NEW direct OpenAI API parent request.
+    const updated = eligible.route === "codex-backend"
+      ? { ...payload, client_metadata: {
+          ...(record(payload.client_metadata) ?? {}), guardian_credits_requested: "true",
+        } }
+      : payload;
     pending = undefined;
     const input = updated.input;
     const first = Array.isArray(input) ? record(input[0]) : undefined;
     const lite = first?.type === "additional_tools" && first.role === "developer";
-    if (Array.isArray(input) && (typeof updated.instructions === "string" || lite) && !updated.previous_response_id) {
+    // New openai-responses serializes the instruction into input, not `instructions`.
+    if (Array.isArray(input) &&
+        (eligible.route === "openai-direct" || typeof updated.instructions === "string" || lite) &&
+        !updated.previous_response_id) {
       const context = JSON.stringify({ instructions: updated.instructions, input, tools: updated.tools });
       if (Buffer.byteLength(context, "utf8") <= MAX_CONTEXT_BYTES) {
         pending = {
@@ -354,14 +398,14 @@ export default function (pi: ExtensionAPI): void {
         };
       }
     }
-    return updated;
+    if (eligible.route === "codex-backend") return updated;
   });
 
   pi.on("provider_stream_event", (event, ctx) => {
     const data = record(event.data);
     const response = record(data?.response);
     if (!armed || !pending || data?.type !== "response.completed" || !response) return;
-    if (event.api !== "openai-codex-responses" || event.provider !== pending.provider || event.model !== pending.modelId) return;
+    if (event.api !== pending.model.api || event.provider !== pending.provider || event.model !== pending.modelId) return;
     if (pending.sessionId !== ctx.sessionManager.getSessionId()) return;
     if (response.status !== "completed" || typeof response.id !== "string" || !response.id.startsWith("resp_")) return;
     pending.responseId = response.id;
@@ -415,7 +459,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("auto-review-probe", {
-    description: "One real ChatGPT Codex Guardian review + before/after quota snapshots (no writes)",
+    description: "One real, harmless Guardian API experiment (Codex quota snapshots only on legacy backend)",
     handler: async (_args, ctx) => {
       if (!ctx.isIdle()) {
         ctx.ui.notify("Wait for the active turn to finish before probing.", "warning");
@@ -433,8 +477,18 @@ export default function (pi: ExtensionAPI): void {
       reset();
       last = undefined;
       armed = true;
-      ctx.ui.notify("Probe armed. Asking your currently selected Codex model to call guardian_probe once.", "info");
+      ctx.ui.notify(eligible.route === "openai-direct"
+        ? "New ChatGPT OAuth route selected. Will test codex-auto-review only on api.openai.com/v1; NOT confirmed free and may use subscription quota."
+        : "Codex backend selected. Asking your model to call guardian_probe once.", "info");
       pi.sendUserMessage("Connectivity test authorized: call the guardian_probe tool exactly once with empty arguments {}. It is a no-op diagnostic: do not call any other tools, and do not modify files. After the tool returns, briefly explain the diagnostic result. Do not infer that the review is free unless its billing is verified.");
+    },
+  });
+
+  pi.registerCommand("auto-review-probe-route", {
+    description: "Identify the ChatGPT OAuth resource without sending any model request",
+    handler: async (_args, ctx) => {
+      const e = endpointEligible(ctx);
+      ctx.ui.notify(`Provider: ${ctx.model?.provider ?? "none"}; API: ${ctx.model?.api ?? "none"}; route: ${e.route ?? "unsupported"}. ${e.reason}`, e.ok ? "info" : "warning");
     },
   });
 
