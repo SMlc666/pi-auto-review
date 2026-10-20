@@ -1,8 +1,8 @@
 {
   "name": "@smlc666/pi-auto-review",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": false,
-  "description": "Experimental ChatGPT Codex Guardian review-path and quota attribution probe for Pi (not an approval system)",
+  "description": "Experimental Guardian API compatibility probe for Pi supporting old Codex and new ChatGPT OAuth login routes; billing unverified",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -13,9 +13,15 @@
     "url": "git+https://github.com/SMlc666/pi-auto-review.git"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
-  "files": ["index.ts", "README.md", "LICENSE"],
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=1.0.4",
     "@earendil-works/pi-coding-agent": ">=1.0.4"
