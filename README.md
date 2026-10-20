@@ -51,7 +51,22 @@ This asks your selected model to invoke `guardian_probe` exactly once. The tool 
 
 Expected output includes the **actual route**, `review-accepted`, `review-denied` or `failed`, the HTTP status, an allowlisted server error code when available, whether a **real parent Response ID** was bound to the tool call, and any Guardian tokens. **Codex quota snapshots are only queried with the legacy Codex OAuth backend** (`codex.5h.usedPercent` and `codex.week.usedPercent` where provided).
 
-The probe performs a real parent inference and attempts a real reviewer inference and **may use subscription quota**. Token counts are not billing. If the before/after rounded quota percentage is unchanged, the only correct conclusion is **billing unverified**, not free. Some accounts may not expose precise per-call usage. Avoid running repeated tests blindly.
+The probe performs a real parent inference and attempts a real reviewer inference and **may use subscription quota**; particularly with random stress-test padding. Token counts are not billing. If the before/after rounded quota percentage is unchanged, the only correct conclusion is **billing unverified**, not free. Some accounts may not expose precise per-call usage. Avoid running repeated tests blindly.
+
+### Reviewer-only random context stress test
+
+Use the same `/auto-review-probe` command with an **optional decimal byte count**. The number controls fresh cryptographically random hexadecimal ASCII characters added to the **reviewer request only**, never the main agent prompt. One ASCII character is one UTF-8 byte. The random text is not written to disk or repeated in diagnostic output; only its truncated SHA-256 digest is shown to confirm that each run used fresh data.
+
+```text
+/auto-review-probe 0
+/auto-review-probe 65536
+/auto-review-probe 131072
+/auto-review-probe 262144
+```
+
+`/auto-review-probe stress` is shorthand for `262144` (256 KiB). The maximum accepted input is `393216` (384 KiB). Start with one intermediate size before jumping to 256 KiB; high-entropy inputs can consume **a large amount of your ChatGPT subscription quota** if this direct API route is not free, or hit model context/rate limits. Stress-test calls get a 120-second timeout; default no-padding calls use 30 seconds. The model sees a `diagnostic_random_padding` field with an explicit instruction that its content must be ignored for the approval decision.
+
+The result reports the **requested reviewer-only random ASCII byte count**, actual reviewer evidence JSON byte length, serialized HTTP request body length, input/cache/output tokens, and the Guardian decision. Comparing `/auto-review-probe 0` against `/auto-review-probe 262144` in **fresh sessions** can establish how token consumption scales, but **not whether Guardian is free**: the main agent call also uses quota, and only the backend controls final billing. For the new ChatGPT OAuth route, inspect ChatGPT app usage separately; the legacy Codex `/wham/usage` endpoint must not be called with the new token.
 
 ## Protocol approach
 
@@ -89,7 +104,7 @@ Codex client code documents `guardian_credits_requested`, `parent_response_id`, 
 - [Pi Codex Responses SDK](https://github.com/earendil-works/pi/blob/main/packages/ai/src/api/openai-codex-responses.ts)
 - [Existing Pi Guardian protocol research](https://github.com/IgorWarzocha/howaboua-pi-stuff/blob/main/packages/pi-codex-guardian/PROTOCOL.md)
 
-No live account request has been made by this repository's authoring assistant. Test result and actual zero-charge entitlement remain **unverified** until you run the command locally.
+The initial unpadded new-OAuth direct-API review returned HTTP 200 with a valid Guardian assessment in user testing. **Free billing remains unverified.** The random-context stress test has not yet been run.
 
 - [Pi new Sign in with ChatGPT OAuth resource](https://github.com/earendil-works/pi/blob/main/packages/ai/src/auth/oauth/openai-chatgpt.ts)
 - [Pi direct OpenAI Responses SDK](https://github.com/earendil-works/pi/blob/main/packages/ai/src/api/openai-responses.ts)
