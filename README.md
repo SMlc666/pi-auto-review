@@ -1,12 +1,12 @@
-# Pi Auto Review — Guardian API & quota probe (E1)
+# Pi Auto Review — Guardian API compatibility probe (E1)
 
 This is an **experimental connectivity and billing-attribution probe** for ChatGPT-subscribed Pi users. It is **not yet** a general permission reviewer, sandbox, or free-inference interface.
 
-The user-facing goal is to run one **authentic harmless tool call** and one **action-bound Codex Guardian review** with Pi's existing ChatGPT OAuth credentials. The probe reads Codex usage before and after the review. It **never assumes a 200 response or stable rounded usage percentages prove the review was free**.
+The user-facing goal is to run one **authentic harmless tool call** and test an **action-bound Guardian reviewer request** with Pi's existing ChatGPT OAuth credential. The reviewer stays on the same OAuth resource as the parent: the **legacy Codex backend** can read Codex quota snapshots; the **new Sign in with ChatGPT** uses the direct OpenAI API and cannot use that Codex-only quota endpoint. Both paths are **experimental**, and neither a 200 response nor stable rounded usage percentages prove the review was free.
 
 ## Installation
 
-Prerequisites: Pi with `@earendil-works/pi-ai` / `@earendil-works/pi-coding-agent` (recent 1.x), Node >= 22.19 or a compatible Bun runtime, and a **native ChatGPT OAuth** Codex provider/model selected in Pi. API-key and proxy routes are intentionally not treated as eligible for this subscription experiment.
+Prerequisites: Pi with `@earendil-works/pi-ai` / `@earendil-works/pi-coding-agent` (recent 1.x), Node >= 22.19 or a compatible Bun runtime, and a **genuine ChatGPT OAuth** OpenAI or Codex model selected in Pi. API-key and proxy routes are intentionally not eligible.
 
 Install directly in Pi:
 
@@ -20,11 +20,24 @@ Or for local development, clone the repository and start Pi with:
 pi --extension ./index.ts
 ```
 
-For the first test, **create a fresh Pi conversation**, select a model whose API is `openai-codex-responses` on `https://chatgpt.com/backend-api`, and temporarily **disable Code Mode or other wrappers that hide native tool calls**. Normal Pi tool mode is required for this first prototype.
+For the first test, **create a fresh Pi conversation** and temporarily **disable Code Mode or other wrappers that hide native tool calls**. Normal Pi tool mode is required for this prototype. Two login modes are recognized:
+
+| Pi login | Provider/API | Endpoint of model/reviewer | Free Guardian status |
+| --- | --- | --- | --- |
+| **New Sign in with ChatGPT** | `openai` / `openai-responses` | `https://api.openai.com/v1/responses` | **Unknown**. Only API/model compatibility is tested; no documented Guardian-free attribution for this OAuth route. |
+| **Legacy OpenAI Codex** | `openai-codex` / `openai-codex-responses` | `https://chatgpt.com/backend-api/codex/responses` | The official Codex client uses Guardian metadata on this route. Actual third-party free billing is still **unverified**. |
+
+> The new OAuth flow requests a token for `https://api.openai.com/v1`, while legacy Codex uses the ChatGPT Codex backend. Tokens must **never be forwarded across these resources**. Calling `codex-auto-review` through the direct API can fail or consume subscription allowance; do not mistake this for verified free Auto-review.
 
 ## Real test: one slash command
 
-In Pi, type:
+In Pi, check the selected authentication route without a model call:
+
+```text
+/auto-review-probe-route
+```
+
+Then run **one** real request (this performs normal model inference and may consume quota):
 
 ```text
 /auto-review-probe
@@ -36,36 +49,38 @@ This asks your selected model to invoke `guardian_probe` exactly once. The tool 
 /auto-review-probe-status
 ```
 
-Expected output includes `review-accepted`, `review-denied` or `failed`, the HTTP status, whether a **real parent Response ID** was bound to the tool call, Guardian model token counts, and Codex quota snapshots (`codex.5h.usedPercent`, `codex.week.usedPercent` where provided).
+Expected output includes the **actual route**, `review-accepted`, `review-denied` or `failed`, the HTTP status, an allowlisted server error code when available, whether a **real parent Response ID** was bound to the tool call, and any Guardian tokens. **Codex quota snapshots are only queried with the legacy Codex OAuth backend** (`codex.5h.usedPercent` and `codex.week.usedPercent` where provided).
 
-The probe performs a real parent inference and a real reviewer inference and **may use subscription quota**. Token counts are not billing. If the before/after rounded quota percentage is unchanged, the only correct conclusion is **billing unverified**, not free. Some accounts may not expose precise per-call usage. Avoid running repeated tests blindly.
+The probe performs a real parent inference and attempts a real reviewer inference and **may use subscription quota**. Token counts are not billing. If the before/after rounded quota percentage is unchanged, the only correct conclusion is **billing unverified**, not free. Some accounts may not expose precise per-call usage. Avoid running repeated tests blindly.
 
 ## Protocol approach
 
-1. Only when explicitly armed by `/auto-review-probe`, add `client_metadata.guardian_credits_requested="true"` to the native parent Codex request through `before_provider_request`.
+1. Only when explicitly armed by `/auto-review-probe`, add `client_metadata.guardian_credits_requested="true"` to **legacy Codex backend** parent requests. Do **not** add undocumented billing metadata to the direct OpenAI API parent.
 2. Observe the actual completed `resp_*` response from Pi's `provider_stream_event`, then bind the assistant's exact `guardian_probe` tool-call ID in `message_end`.
-3. Use `ctx.modelRegistry.streamSimple()` with the **same selected OAuth Codex provider**, letting the SDK construct auth, session headers, URL and SSE. The model is set to `codex-auto-review` with low reasoning.
+3. Use `ctx.modelRegistry.streamSimple()` with the **same selected OAuth provider and API implementation** (`openai-responses` or `openai-codex-responses`), letting Pi SDK construct auth, session headers, URL and SSE. The reviewer model is `codex-auto-review` with low reasoning. No cross-endpoint token forwarding.
 4. At its `onPayload` boundary, build the **tool-less structured review body**, referencing the real parent's response ID. At its `fetch` boundary, preserve SDK authentication while adding `x-codex-guardian: reviewer`, `x-openai-subagent: guardian`, session/turn and parent-thread identifiers.
-5. Read `GET https://chatgpt.com/backend-api/wham/usage` immediately before and after review with the SDK-issued account and bearer headers. Only display usage percentages, not raw account IDs, bearer tokens, request payloads or API response bodies.
+5. For **legacy Codex backend only**, read `GET https://chatgpt.com/backend-api/wham/usage` immediately before/after review with the SDK-issued Codex account bearer headers. **Never** submit a new OpenAI API OAuth token to `/wham/usage`. Display only quota percentages, not raw account IDs, bearer tokens, request payloads or API response bodies.
 
-For integrity, the extension only targets the official `https://chatgpt.com/backend-api/codex/responses` reviewer URL, only accepts genuine OAuth subscription sessions, never fabricates parent IDs, and does **not** claim to be the official Codex CLI (`originator`/User-Agent remain Pi's genuine ones). If the server requires additional entitlement or official-client identity, report the resulting failure; do not attempt to evade it.
+For integrity, the extension permits only the **same official OAuth resource** as its selected parent (`chatgpt.com/backend-api/codex/responses` for legacy, `api.openai.com/v1/responses` for new login), only accepts genuine OAuth subscription sessions, never fabricates parent IDs, and does **not** claim to be the official Codex CLI (`originator`/User-Agent remain Pi's genuine ones). If the server requires additional entitlement or official-client identity, report the resulting failure; do not attempt to evade it.
 
 ## Interpreting results
 
 | Result | What we learned |
 | --- | --- |
-| No eligible model | Select a native ChatGPT OAuth Codex model/provider, not a custom proxy |
+| No eligible model | Check `/auto-review-probe-route`; select a real ChatGPT OAuth model, not an API key or custom proxy |
 | No parent Response ID | Use a fresh conversation; disable Code Mode/tool wrappers; try again |
 | HTTP 400 / 401 / 403 | The server rejected the request or credential/protocol; not proof that the feature is unavailable in official Codex |
-| Valid `allow`/`deny` | The action-bound Guardian inference path was reachable |
+| Valid `allow`/`deny` | The experimental action-bound Guardian inference path was reachable, **not necessarily free** |
+| Direct API model error | New ChatGPT OAuth may not have access to `codex-auto-review`; the official free Codex path is not established on this route |
 | Quota visibly increased | Not proof the reviewer was billed specifically; check other concurrent model activity |
 | Quota unchanged | **Not proof of free use**; the displayed percentage may be rounded or delayed |
+| New login with no quota snapshots | Expected: its token is scoped to the direct API rather than Codex `/wham/usage` |
 
 ## Limits and next milestone
 
 This implementation purposely has **no automatic authorization** for ordinary Pi tools, no response-cache bypass, no attempts to conceal client identity, and no generic access to the `codex-auto-review` model. For a useful production extension, E2 would need stronger authorization boundaries, full parent/action freshness validation, recovery/cancel behavior, persistent audit with credential redaction, and an independent billing measurement.
 
-Codex client code documents `guardian_credits_requested`, `parent_response_id`, `x-codex-guardian`, and that Guardian billing is backend-controlled. The backend billing algorithm is not open sourced, and ChatGPT's official free Auto-review entitlement is **not guaranteed for third-party Pi integrations**.
+Codex client code documents `guardian_credits_requested`, `parent_response_id`, `x-codex-guardian`, and that Guardian billing is backend-controlled. The new Pi OAuth implementation explicitly sets `resource=https://api.openai.com/v1` rather than the legacy Codex backend. The backend billing algorithm is not open sourced, and ChatGPT's official free Auto-review entitlement is **not guaranteed for third-party Pi integrations**.
 
 ### Reference implementation and protocol notes
 
@@ -75,3 +90,6 @@ Codex client code documents `guardian_credits_requested`, `parent_response_id`, 
 - [Existing Pi Guardian protocol research](https://github.com/IgorWarzocha/howaboua-pi-stuff/blob/main/packages/pi-codex-guardian/PROTOCOL.md)
 
 No live account request has been made by this repository's authoring assistant. Test result and actual zero-charge entitlement remain **unverified** until you run the command locally.
+
+- [Pi new Sign in with ChatGPT OAuth resource](https://github.com/earendil-works/pi/blob/main/packages/ai/src/auth/oauth/openai-chatgpt.ts)
+- [Pi direct OpenAI Responses SDK](https://github.com/earendil-works/pi/blob/main/packages/ai/src/api/openai-responses.ts)
