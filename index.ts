@@ -381,6 +381,15 @@ export default function (pi: ExtensionAPI): void {
     pending = undefined;
   });
 
+  pi.on("agent_settled", (_event, ctx) => {
+    if (!armed) return;
+    armed = false;
+    pending = undefined;
+    parents.clear();
+    last = { result: "failed", detail: "The model did not call guardian_probe. Use standard Pi tools (disable Code Mode), start a fresh conversation, then retry.", parentLinked: false };
+    ctx.ui.notify(formatReport(last), "warning");
+  });
+
   pi.registerTool({
     name: "guardian_probe",
     label: "Guardian billing probe",
@@ -413,6 +422,10 @@ export default function (pi: ExtensionAPI): void {
         return;
       }
       const eligible = endpointEligible(ctx);
+      if (!pi.getActiveTools().includes("guardian_probe")) {
+        ctx.ui.notify("guardian_probe is not an active direct tool. Enable it / disable Code Mode, then retry.", "warning");
+        return;
+      }
       if (!eligible.ok) {
         ctx.ui.notify(`Probe not started: ${eligible.reason}`, "warning");
         return;
