@@ -383,19 +383,36 @@ function formatReport(report: Report): string {
 export default function (pi: ExtensionAPI): void {
   let armed = false;
   let requestedPaddingBytes = 0;
+  let directCreditExperiment = false;
   let pending: Pending | undefined;
   const parents = new Map<string, Parent>();
   let last: Report | undefined;
 
-  function reset(): void { armed = false; requestedPaddingBytes = 0; pending = undefined; parents.clear(); }
+  function reset(): void {
+    armed = false;
+    requestedPaddingBytes = 0;
+    directCreditExperiment = false;
+    pending = undefined;
+    parents.clear();
+  }
 
-  function parsePaddingBytes(args: string): number | undefined {
-    const value = args.trim();
-    if (!value) return 0;
-    if (value === "stress") return DEFAULT_STRESS_BYTES;
+  function parseProbeArgs(args: string): { paddingBytes: number; requestDirectCredits: boolean } | undefined {
+    const tokens = args.trim() ? args.trim().split(/\s+/) : [];
+    // /auto-review-probe [0|65536|...|stress] [credits]
+    if (tokens.length > 2) return undefined;
+    const creditsIndex = tokens.indexOf("credits");
+    if (creditsIndex !== -1 && creditsIndex !== tokens.length - 1) return undefined;
+    const requestDirectCredits = creditsIndex !== -1;
+    const sizeTokens = requestDirectCredits ? tokens.slice(0, -1) : tokens;
+    if (sizeTokens.length > 1) return undefined;
+    const value = sizeTokens[0] ?? "";
+    if (!value) return { paddingBytes: 0, requestDirectCredits };
+    if (value === "stress") return { paddingBytes: DEFAULT_STRESS_BYTES, requestDirectCredits };
     if (!/^(0|[1-9][0-9]*)$/.test(value)) return undefined;
     const count = Number(value);
-    return Number.isSafeInteger(count) && count <= MAX_RANDOM_BYTES ? count : undefined;
+    return Number.isSafeInteger(count) && count <= MAX_RANDOM_BYTES
+      ? { paddingBytes: count, requestDirectCredits }
+      : undefined;
   }
   pi.on("session_start", reset);
   pi.on("session_shutdown", reset);
@@ -410,9 +427,12 @@ export default function (pi: ExtensionAPI): void {
     if (!eligible.ok || !eligible.route) return;
     const payload = record(event.payload);
     if (!payload || payload.model !== ctx.model?.id) return;
-    // Only the Codex backend is known to accept Guardian billing metadata.
-    // Do not add unsupported metadata to the NEW direct OpenAI API parent request.
-    const updated = eligible.route === "codex-backend"
+    // The official Codex client inserts this only on the Codex backend.
+    // A direct API attempt is opt-in for ONE probe, for controlled compatibility testing.
+    // Never insert parent billing metadata into the reviewer request.
+    const includeCredits = eligible.route === "codex-backend"
+      || (eligible.route === "openai-direct" && directCreditExperiment);
+    const updated = includeCredits
       ? { ...payload, client_metadata: {
           ...(record(payload.client_metadata) ?? {}), guardian_credits_requested: "true",
         } }
@@ -436,7 +456,7 @@ export default function (pi: ExtensionAPI): void {
         };
       }
     }
-    if (eligible.route === "codex-backend") return updated;
+    if (includeCredits) return updated;
   });
 
   pi.on("provider_stream_event", (event, ctx) => {
@@ -482,8 +502,10 @@ export default function (pi: ExtensionAPI): void {
       if (!armed) return { content: [{ type: "text", text: "Probe not armed. Run /auto-review-probe." }], details: undefined };
       const parent = parents.get(toolCallId);
       const paddingBytes = requestedPaddingBytes;
+      const usedExperimentalCredits = directCreditExperiment;
       armed = false;
       requestedPaddingBytes = 0;
+      directCreditExperiment = false;
       parents.clear();
       pending = undefined;
       if (!parent || !endpointEligible(ctx).ok) {
@@ -492,20 +514,24 @@ export default function (pi: ExtensionAPI): void {
       } else {
         last = await review(ctx, parent, signal, paddingBytes);
       }
-      const text = formatReport(last);
+      const text = formatReport(last)
+        + (usedExperimentalCredits
+          ? "\nEXPERIMENT: Parent request opted into guardian_credits_requested=true on direct API. HTTP success does NOT prove free billing."
+          : "\nEXPERIMENT: Direct API parent credit metadata not requested (baseline).");
       ctx.ui.notify(text, last.result === "failed" ? "warning" : "info");
       return { content: [{ type: "text", text }], details: undefined };
     },
   });
 
   pi.registerCommand("auto-review-probe", {
-    description: "One real, harmless Guardian API experiment (Codex quota snapshots only on legacy backend)",
+    description: "Guardian API experiment: optional bytes and opt-in direct API credit metadata",
     handler: async (args, ctx) => {
-      const paddingBytes = parsePaddingBytes(args);
-      if (paddingBytes === undefined) {
-        ctx.ui.notify(`Usage: /auto-review-probe [ASCII_random_bytes | stress]. Allowed: 0..${MAX_RANDOM_BYTES}; stress=${DEFAULT_STRESS_BYTES}. High-entropy requests may consume substantial quota.`, "warning");
+      const parsed = parseProbeArgs(args);
+      if (!parsed) {
+        ctx.ui.notify(`Usage: /auto-review-probe [ASCII_random_bytes | stress] [credits]. Allowed: 0..${MAX_RANDOM_BYTES}; stress=${DEFAULT_STRESS_BYTES}. The credits flag experimentally adds guardian_credits_requested=true to the direct API PARENT request, not the reviewer. It may be rejected or still billed.`, "warning");
         return;
       }
+      const { paddingBytes, requestDirectCredits } = parsed;
       if (!ctx.isIdle()) {
         ctx.ui.notify("Wait for the active turn to finish before probing.", "warning");
         return;
@@ -523,9 +549,13 @@ export default function (pi: ExtensionAPI): void {
       last = undefined;
       armed = true;
       requestedPaddingBytes = paddingBytes;
+      directCreditExperiment = requestDirectCredits && eligible.route === "openai-direct";
       ctx.ui.notify((eligible.route === "openai-direct"
         ? "New ChatGPT OAuth route selected; reviewer uses api.openai.com/v1. Free billing is NOT verified."
-        : "Codex backend selected.") +
+        : "Codex backend selected; native parent credit metadata already enabled.") +
+        (directCreditExperiment
+          ? " Experimental guardian_credits_requested=true will be added to the direct API PARENT request only; unsupported fields may cause HTTP 400."
+          : "") +
         ` Reviewer-only random padding: ${paddingBytes} UTF-8 bytes; this request may use substantial subscription quota.`, "info");
       pi.sendUserMessage("Connectivity test authorized: call the guardian_probe tool exactly once with empty arguments {}. It is a no-op diagnostic: do not call any other tools, and do not modify files. After the tool returns, briefly explain the diagnostic result. Do not infer that the review is free unless its billing is verified.");
     },
