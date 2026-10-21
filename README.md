@@ -64,13 +64,24 @@ Use the same `/auto-review-probe` command with an **optional decimal byte count*
 /auto-review-probe 262144
 ```
 
+### Experimental parent-credit metadata A/B test (new ChatGPT OAuth)
+
+The official Codex client adds `client_metadata.guardian_credits_requested="true"` to qualifying **Codex-backend parent requests**. It does **not** add this metadata on the newer `api.openai.com/v1` path. To test whether direct Responses accepts the field, run two explicitly chosen probes in **separate fresh Pi sessions**, using the same model:
+
+```text
+/auto-review-probe 0
+/auto-review-probe 0 credits
+```
+
+The first is a baseline. The `credits` option adds `guardian_credits_requested="true"` **only to the main Agent's request**, not to the Guardian reviewer request. The flag is never enabled globally or for ordinary Pi activity. The same option works with a specified reviewer-only random load, e.g. `/auto-review-probe 65536 credits`. However, **first test the 0-byte variant** to check that the server accepts the extra field. The direct API might reject `client_metadata` with HTTP 400, accept but ignore it, or accept it without granting any free entitlement. HTTP 200 is not evidence that the field changed billing. Never treat a zero change in rounded quota meters as conclusive; background account activity and meter delay can confound any result. These are real requests and may use quota.
+
 `/auto-review-probe stress` is shorthand for `262144` (256 KiB). The maximum accepted input is `393216` (384 KiB). Start with one intermediate size before jumping to 256 KiB; high-entropy inputs can consume **a large amount of your ChatGPT subscription quota** if this direct API route is not free, or hit model context/rate limits. Stress-test calls get a 120-second timeout; default no-padding calls use 30 seconds. The model sees a `diagnostic_random_padding` field with an explicit instruction that its content must be ignored for the approval decision.
 
 The result reports the **requested reviewer-only random ASCII byte count**, actual reviewer evidence JSON byte length, serialized HTTP request body length, input/cache/output tokens, and the Guardian decision. Comparing `/auto-review-probe 0` against `/auto-review-probe 262144` in **fresh sessions** can establish how token consumption scales, but **not whether Guardian is free**: the main agent call also uses quota, and only the backend controls final billing. For the new ChatGPT OAuth route, inspect ChatGPT app usage separately; the legacy Codex `/wham/usage` endpoint must not be called with the new token.
 
 ## Protocol approach
 
-1. Only when explicitly armed by `/auto-review-probe`, add `client_metadata.guardian_credits_requested="true"` to **legacy Codex backend** parent requests. Do **not** add undocumented billing metadata to the direct OpenAI API parent.
+1. Only when explicitly armed by `/auto-review-probe`, add `client_metadata.guardian_credits_requested="true"` to **legacy Codex backend** parent requests. On the new OpenAI API direct route, this field is **off by default** and added to the parent only when `credits` is explicitly specified. The extra field is an unsupported/undocumented experiment on that route, not a proven free-billing mechanism.
 2. Observe the actual completed `resp_*` response from Pi's `provider_stream_event`, then bind the assistant's exact `guardian_probe` tool-call ID in `message_end`.
 3. Use `ctx.modelRegistry.streamSimple()` with the **same selected OAuth provider and API implementation** (`openai-responses` or `openai-codex-responses`), letting Pi SDK construct auth, session headers, URL and SSE. The reviewer model is `codex-auto-review` with low reasoning. No cross-endpoint token forwarding.
 4. At its `onPayload` boundary, build the **tool-less structured review body**, referencing the real parent's response ID. At its `fetch` boundary, preserve SDK authentication while adding `x-codex-guardian: reviewer`, `x-openai-subagent: guardian`, session/turn and parent-thread identifiers.
@@ -104,7 +115,7 @@ Codex client code documents `guardian_credits_requested`, `parent_response_id`, 
 - [Pi Codex Responses SDK](https://github.com/earendil-works/pi/blob/main/packages/ai/src/api/openai-codex-responses.ts)
 - [Existing Pi Guardian protocol research](https://github.com/IgorWarzocha/howaboua-pi-stuff/blob/main/packages/pi-codex-guardian/PROTOCOL.md)
 
-The initial unpadded new-OAuth direct-API review returned HTTP 200 with a valid Guardian assessment in user testing. **Free billing remains unverified.** The random-context stress test has not yet been run.
+The initial unpadded new-OAuth direct-API review returned HTTP 200 with a valid Guardian assessment in user testing. The user subsequently observed consumption of their quota on the direct route. **The optional `credits` experiment has not been run or verified.**
 
 - [Pi new Sign in with ChatGPT OAuth resource](https://github.com/earendil-works/pi/blob/main/packages/ai/src/auth/oauth/openai-chatgpt.ts)
 - [Pi direct OpenAI Responses SDK](https://github.com/earendil-works/pi/blob/main/packages/ai/src/api/openai-responses.ts)
